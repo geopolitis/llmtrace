@@ -77,6 +77,14 @@ jobs:
     name: Coverage (llvm-cov)
     runs-on: ubuntu-latest
     needs: test
+    outputs:
+      line_coverage: ${{ steps.coverage_metrics.outputs.line_coverage }}
+      uncovered_pct: ${{ steps.coverage_metrics.outputs.uncovered_pct }}
+      lines_hit: ${{ steps.coverage_metrics.outputs.lines_hit }}
+      lines_found: ${{ steps.coverage_metrics.outputs.lines_found }}
+      code_loc: ${{ steps.coverage_metrics.outputs.code_loc }}
+      test_loc: ${{ steps.coverage_metrics.outputs.test_loc }}
+      test_to_code_pct: ${{ steps.coverage_metrics.outputs.test_to_code_pct }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,6 +109,40 @@ jobs:
             ${{ runner.os }}-cargo-coverage-
       - name: Generate LCOV report
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Compute coverage metrics
+        id: coverage_metrics
+        shell: bash
+        run: |
+          # Aggregate line coverage from LCOV
+          read -r LH LF <<< "$(awk -F: '
+            /^LH:/ {lh += $2}
+            /^LF:/ {lf += $2}
+            END {print lh+0, lf+0}
+          ' lcov.info)"
+
+          LINE_COVERAGE="$(awk -v lh="$LH" -v lf="$LF" 'BEGIN { if (lf==0) print "0.00"; else printf "%.2f", (lh/lf)*100 }')"
+          UNCOVERED_PCT="$(awk -v c="$LINE_COVERAGE" 'BEGIN { printf "%.2f", 100-c }')"
+
+          # Approximate source vs tests LOC ratio (non-empty, non-comment lines)
+          CODE_LOC="$(find crates -type f -path "*/src/*.rs" ! -path "*/tests/*" -print0 \
+            | xargs -0r cat \
+            | grep -Ev '^[[:space:]]*(//|$)' \
+            | wc -l | tr -d ' ')"
+
+          TEST_LOC="$(find crates -type f \( -path "*/tests/*.rs" -o -path "*/tests/**/*.rs" \) -print0 \
+            | xargs -0r cat \
+            | grep -Ev '^[[:space:]]*(//|$)' \
+            | wc -l | tr -d ' ')"
+
+          TEST_TO_CODE_PCT="$(awk -v t="$TEST_LOC" -v c="$CODE_LOC" 'BEGIN { if (c==0) print "0.00"; else printf "%.2f", (t/c)*100 }')"
+
+          echo "line_coverage=$LINE_COVERAGE" >> "$GITHUB_OUTPUT"
+          echo "uncovered_pct=$UNCOVERED_PCT" >> "$GITHUB_OUTPUT"
+          echo "lines_hit=$LH" >> "$GITHUB_OUTPUT"
+          echo "lines_found=$LF" >> "$GITHUB_OUTPUT"
+          echo "code_loc=$CODE_LOC" >> "$GITHUB_OUTPUT"
+          echo "test_loc=$TEST_LOC" >> "$GITHUB_OUTPUT"
+          echo "test_to_code_pct=$TEST_TO_CODE_PCT" >> "$GITHUB_OUTPUT"
       - name: Generate HTML report
         run: cargo llvm-cov --workspace --html
       - name: Upload coverage to Codecov
@@ -299,3 +341,73 @@ jobs:
         if: always()
         with:
           sarif_file: trivy-results.sarif
+
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - test
+      - coverage
+      - integration
+      - benchmarks
+      - build
+      - trivy-scan
+    steps:
+      - name: Publish human-readable summary
+        shell: bash
+        env:
+          FMT: ${{ needs.fmt.result }}
+          CLIPPY: ${{ needs.clippy.result }}
+          TEST: ${{ needs.test.result }}
+          COVERAGE_JOB: ${{ needs.coverage.result }}
+          INTEGRATION: ${{ needs.integration.result }}
+          BENCHMARKS: ${{ needs.benchmarks.result }}
+          BUILD: ${{ needs.build.result }}
+          TRIVY: ${{ needs.trivy-scan.result }}
+          LINE_COVERAGE: ${{ needs.coverage.outputs.line_coverage }}
+          UNCOVERED_PCT: ${{ needs.coverage.outputs.uncovered_pct }}
+          LINES_HIT: ${{ needs.coverage.outputs.lines_hit }}
+          LINES_FOUND: ${{ needs.coverage.outputs.lines_found }}
+          CODE_LOC: ${{ needs.coverage.outputs.code_loc }}
+          TEST_LOC: ${{ needs.coverage.outputs.test_loc }}
+          TEST_TO_CODE_PCT: ${{ needs.coverage.outputs.test_to_code_pct }}
+        run: |
+          status_icon() {
+            case "$1" in
+              success) echo "PASS" ;;
+              failure) echo "FAIL" ;;
+              cancelled) echo "CANCELLED" ;;
+              skipped) echo "SKIPPED" ;;
+              *) echo "${1:-UNKNOWN}" ;;
+            esac
+          }
+
+          {
+            echo "## CI Results"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Format | $(status_icon "$FMT") |"
+            echo "| Clippy | $(status_icon "$CLIPPY") |"
+            echo "| Tests | $(status_icon "$TEST") |"
+            echo "| Coverage job | $(status_icon "$COVERAGE_JOB") |"
+            echo "| Integration Tests | $(status_icon "$INTEGRATION") |"
+            echo "| Benchmarks | $(status_icon "$BENCHMARKS") |"
+            echo "| Build | $(status_icon "$BUILD") |"
+            echo "| Trivy Scan | $(status_icon "$TRIVY") |"
+            echo ""
+            echo "## Coverage Metrics"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|---|---|"
+            echo "| Codebase covered % | ${LINE_COVERAGE:-N/A}% |"
+            echo "| Codebase uncovered % | ${UNCOVERED_PCT:-N/A}% |"
+            echo "| Covered lines | ${LINES_HIT:-N/A} |"
+            echo "| Total lines instrumented | ${LINES_FOUND:-N/A} |"
+            echo "| Source LOC | ${CODE_LOC:-N/A} |"
+            echo "| Test LOC | ${TEST_LOC:-N/A} |"
+            echo "| Test-to-code LOC % | ${TEST_TO_CODE_PCT:-N/A}% |"
+          } >> "$GITHUB_STEP_SUMMARY"
